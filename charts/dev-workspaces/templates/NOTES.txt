@@ -1,0 +1,108 @@
+==============================================================================
+ dev-workspaces -- workspace for "{{ .Values.user }}" is installed
+==============================================================================
+
+  Developer       : {{ .Values.user }}
+  Resource prefix : {{ include "dev-workspaces.fullname" . }}
+  Release name    : {{ .Release.Name }}
+  Namespace       : {{ .Release.Namespace }}
+  State           : {{ if .Values.suspended }}SUSPENDED (Deployment replicas=0, zero compute){{ else }}RUNNING (Deployment replicas=1){{ end }}
+
+{{- if .Values.route.enabled }}
+
+------------------------------------------------------------------------------
+ Access
+------------------------------------------------------------------------------
+  URL : https://{{ include "dev-workspaces.routeHost" . }}
+{{- if .Values.oauthProxy.enabled }}
+
+  Access is gated by OpenShift OAuth -- sign in with your cluster credentials.
+{{- end }}
+  code-server is served at "/"; Jupyter Lab is proxied under "{{ .Values.workspace.jupyter.basePath }}".
+{{- end }}
+
+------------------------------------------------------------------------------
+ Ops prerequisites (NOT created by this chart)
+------------------------------------------------------------------------------
+{{- $hasPrereq := false }}
+{{- if and .Values.route.enabled .Values.route.tls.externalCertificate.name }}
+{{- $hasPrereq = true }}
+
+  * TLS Secret "{{ .Values.route.tls.externalCertificate.name }}" (kubernetes.io/tls)
+    must already exist in namespace "{{ .Release.Namespace }}" and cover the
+    Route host "{{ include "dev-workspaces.routeHost" . }}" in its SAN.
+    - route.tls.externalCertificate requires OpenShift 4.19+ (or the
+      RouteExternalCertificate feature gate on 4.16-4.18).
+{{- if .Values.route.tls.createRouterRbac }}
+    - The chart grants the router SA ({{ .Values.route.tls.routerServiceAccount.namespace }}:{{ .Values.route.tls.routerServiceAccount.name }})
+      read access to this Secret (route.tls.createRouterRbac=true).
+{{- else }}
+    - route.tls.createRouterRbac=false: Ops MUST grant the router SA
+      ({{ .Values.route.tls.routerServiceAccount.namespace }}:{{ .Values.route.tls.routerServiceAccount.name }}) read access to this Secret,
+      or the router silently serves its default wildcard cert.
+{{- end }}
+{{- end }}
+{{- if and .Values.oauthProxy.enabled .Values.oauthProxy.cookieSecret.existingSecret }}
+{{- $hasPrereq = true }}
+
+  * oauth cookie Secret "{{ .Values.oauthProxy.cookieSecret.existingSecret }}" (Opaque, key "{{ .Values.oauthProxy.cookieSecret.key }}")
+    must already exist in namespace "{{ .Release.Namespace }}". The value MUST be
+    16, 24, or 32 bytes (AES). Example:
+      oc create secret generic {{ .Values.oauthProxy.cookieSecret.existingSecret }} \
+        --from-literal={{ .Values.oauthProxy.cookieSecret.key }}=$(openssl rand -base64 32)
+{{- end }}
+{{- if and .Values.ssh.enabled .Values.ssh.existingSecret }}
+{{- $hasPrereq = true }}
+
+  * SSH Secret "{{ .Values.ssh.existingSecret }}" (Opaque, key "{{ .Values.ssh.key }}")
+    must already exist in namespace "{{ .Release.Namespace }}" with your public
+    authorized_keys. SSH listens on container port {{ .Values.ssh.containerPort }}.
+{{- end }}
+{{- if not .Values.scc.create }}
+{{- $hasPrereq = true }}
+
+  * SCC grant: scc.create=false, so no SecurityContextConstraints is rendered.
+    The pod runs as fixed UID {{ .Values.securityContext.runAsUser }}, which the default
+    restricted-v2 SCC REJECTS. Ops (cluster-admin) must grant a suitable SCC
+    (anyuid or a custom SCC pinned to UID {{ .Values.securityContext.runAsUser }}) to the ServiceAccount
+    "{{ include "dev-workspaces.serviceAccountName" . }}", or set scc.create=true.
+{{- end }}
+{{- if and .Values.persistence.enabled (not .Values.persistence.storageClassName) }}
+{{- $hasPrereq = true }}
+
+  * StorageClass: persistence.storageClassName is empty, so the PVC uses the
+    cluster DEFAULT StorageClass. If the cluster has NO default, the PVC stays
+    Pending -- set persistence.storageClassName explicitly.
+{{- end }}
+{{- if not $hasPrereq }}
+
+  (none for the current configuration)
+{{- end }}
+
+------------------------------------------------------------------------------
+ Heads up: placeholder image
+------------------------------------------------------------------------------
+  The workspace image is a placeholder:
+      {{ include "dev-workspaces.image" . }}
+  The pod will report ImagePullBackOff until the real image ships. This is
+  EXPECTED for now.
+
+------------------------------------------------------------------------------
+ Suspend / Resume
+------------------------------------------------------------------------------
+  Suspend (scale to 0 replicas, retain PVC):
+      helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values --set suspended=true
+
+  Resume (scale back to 1 replica, prior data intact):
+      helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reuse-values --set suspended=false
+
+{{- if and .Values.persistence.enabled .Values.persistence.retain }}
+
+------------------------------------------------------------------------------
+ PVC retention
+------------------------------------------------------------------------------
+  The PVC (volume "workspace-data") is annotated helm.sh/resource-policy: keep,
+  so it SURVIVES "helm uninstall {{ .Release.Name }}". Your $HOME at
+  {{ .Values.persistence.mountPath }} is preserved. To reattach it later, reinstall
+  with the SAME release name ("{{ .Release.Name }}") and the same user.
+{{- end }}

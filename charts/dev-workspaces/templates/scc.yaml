@@ -1,0 +1,129 @@
+{{/*
+SecurityContextConstraints grant (Spec 5.9) -- optional, gated on scc.create.
+Applying an SCC (or binding the built-in anyuid SCC) requires cluster-admin, so
+this whole file is OFF by default (scc.create=false).
+
+Two modes via .Values.scc.use:
+  custom => render a least-privilege SCC pinned to securityContext.runAsUser,
+            plus a Role granting `use` on exactly that SCC and a RoleBinding
+            that grants it to this release's ServiceAccount.
+  anyuid => render NO SCC object; bind the PRE-EXISTING cluster ClusterRole
+            system:openshift:scc:anyuid (RunAsAny) to the ServiceAccount.
+
+fsGroup uses {type: RunAsAny} so the pod's hardcoded fsGroup (1001) is admitted
+without the SCC having to enumerate an allowed range.
+*/}}
+{{- if .Values.scc.create }}
+{{- if eq .Values.scc.use "custom" }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ include "dev-workspaces.sccName" . }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- $sccAnnotations := merge (deepCopy (.Values.scc.annotations | default dict)) (fromYaml (include "dev-workspaces.annotations" .) | default dict) }}
+  {{- with $sccAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+# Explicit priority so this SCC is selected over any other accepting SCC the SA
+# may also be granted (OpenShift sorts candidate SCCs by priority desc; a nil
+# priority sorts as 0). Pinned to the workspace's fixed UID below.
+priority: {{ .Values.scc.priority }}
+runAsUser:
+  type: MustRunAs
+  uid: {{ .Values.securityContext.runAsUser }}
+# RunAsAny so the pod's hardcoded fsGroup is admitted (it owns the RWO PVC).
+fsGroup:
+  type: RunAsAny
+seLinuxContext:
+  type: MustRunAs
+supplementalGroups:
+  type: RunAsAny
+requiredDropCapabilities:
+  - ALL
+# Only admit the RuntimeDefault seccomp profile the pod uses; locks out Unconfined.
+seccompProfiles:
+  - runtime/default
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: false
+allowHostNetwork: false
+allowHostPorts: false
+allowHostPID: false
+allowHostIPC: false
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - persistentVolumeClaim
+  - projected
+  - secret
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ printf "%s-use" (include "dev-workspaces.sccName" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- $useAnnotations := merge (deepCopy (.Values.scc.annotations | default dict)) (fromYaml (include "dev-workspaces.annotations" .) | default dict) }}
+  {{- with $useAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups:
+      - security.openshift.io
+    resources:
+      - securitycontextconstraints
+    verbs:
+      - use
+    resourceNames:
+      - {{ include "dev-workspaces.sccName" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-use" (include "dev-workspaces.sccName" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- $bindAnnotations := merge (deepCopy (.Values.scc.annotations | default dict)) (fromYaml (include "dev-workspaces.annotations" .) | default dict) }}
+  {{- with $bindAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ printf "%s-use" (include "dev-workspaces.sccName" .) | trunc 63 | trimSuffix "-" }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dev-workspaces.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- else if eq .Values.scc.use "anyuid" }}
+# anyuid mode: bind the PRE-EXISTING cluster ClusterRole system:openshift:scc:anyuid
+# (which grants `use` on the built-in RunAsAny `anyuid` SCC). No SCC object is
+# rendered. NOTE: binding anyuid still requires cluster-admin -- the ClusterRole
+# is platform-provided, but only a cluster-admin may create this RoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-anyuid" (include "dev-workspaces.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- $anyuidAnnotations := merge (deepCopy (.Values.scc.annotations | default dict)) (fromYaml (include "dev-workspaces.annotations" .) | default dict) }}
+  {{- with $anyuidAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dev-workspaces.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

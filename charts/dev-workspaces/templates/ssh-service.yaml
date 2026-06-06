@@ -1,0 +1,26 @@
+{{- if .Values.ssh.enabled }}
+{{- /* Secret validation runs centrally from deployment.yaml (always rendered),
+       which covers route TLS, oauth cookie, and ssh secrets in every scenario. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-ssh" (include "dev-workspaces.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- with .Values.ssh.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.ssh.service.type }}
+  selector:
+    {{- include "dev-workspaces.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ssh
+      port: {{ .Values.ssh.service.port }}
+      targetPort: ssh
+      protocol: TCP
+      {{- if and (eq .Values.ssh.service.type "NodePort") (not (kindIs "invalid" .Values.ssh.service.nodePort)) }}
+      nodePort: {{ .Values.ssh.service.nodePort }}
+      {{- end }}
+{{- end }}

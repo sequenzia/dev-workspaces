@@ -1,0 +1,40 @@
+# Example per-developer values (GitOps-style) for the dev-workspaces chart.
+#
+# This is the file you commit per developer. It overrides ONLY what differs
+# from the chart defaults: the user, the public hostname, and the NAMES of
+# pre-created Secrets. No secret material lives here.
+#
+# Ops must pre-create (once per developer), in the install namespace:
+#   oc create secret tls   alice-workspace-tls \
+#       --cert=alice.crt --key=alice.key
+#   oc create secret generic alice-oauth-cookie \
+#       --from-literal=cookie-secret=$(openssl rand -base64 32)
+#
+# Install:
+#   helm install alice charts/dev-workspaces -n dev-workspaces \
+#       -f examples/values-developer.yaml
+user: alice
+
+route:
+  host: alice-workspace.apps.example.com
+  tls:
+    externalCertificate:
+      name: alice-workspace-tls
+
+oauthProxy:
+  cookieSecret:
+    existingSecret: alice-oauth-cookie
+
+persistence:
+  size: 20Gi
+  # Set explicitly when the cluster has no default StorageClass.
+  storageClassName: ocs-storagecluster-ceph-rbd
+
+workspace:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi

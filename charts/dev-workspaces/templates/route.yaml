@@ -1,0 +1,85 @@
+{{- if .Values.route.enabled }}
+{{- include "dev-workspaces.validateSecrets" . }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "dev-workspaces.fullname" . }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+    {{- with .Values.route.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    haproxy.router.openshift.io/timeout: {{ .Values.route.timeout | quote }}
+    # On an edge route an upgraded WebSocket becomes a tunnel governed by
+    # `timeout tunnel`, NOT `timeout server`; set both so long-lived
+    # code-server / Jupyter WebSocket sessions honor the configured value.
+    haproxy.router.openshift.io/timeout-tunnel: {{ .Values.route.timeout | quote }}
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.route.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  host: {{ include "dev-workspaces.routeHost" . | quote }}
+  {{- with .Values.route.path }}
+  path: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "dev-workspaces.fullname" . }}
+    weight: 100
+  port:
+    targetPort: public
+  wildcardPolicy: {{ .Values.route.wildcardPolicy }}
+  tls:
+    termination: {{ .Values.route.tls.termination }}
+    insecureEdgeTerminationPolicy: {{ .Values.route.tls.insecureEdgeTerminationPolicy }}
+    externalCertificate:
+      name: {{ .Values.route.tls.externalCertificate.name | quote }}
+{{- if .Values.route.tls.createRouterRbac }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ printf "%s-cert-reader" (include "dev-workspaces.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+    {{- with .Values.route.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+    resourceNames:
+      - {{ .Values.route.tls.externalCertificate.name | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-cert-reader" (include "dev-workspaces.fullname" .) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+    {{- with .Values.route.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ printf "%s-cert-reader" (include "dev-workspaces.fullname" .) | trunc 63 | trimSuffix "-" }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.route.tls.routerServiceAccount.name }}
+    namespace: {{ .Values.route.tls.routerServiceAccount.namespace }}
+{{- end }}
+{{- end }}

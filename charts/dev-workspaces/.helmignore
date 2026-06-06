@@ -1,0 +1,47 @@
+# Patterns to ignore when building Helm packages.
+# Mirrors .gitignore syntax; matches at any directory depth.
+
+# --- VCS ---
+.git/
+.gitignore
+.gitattributes
+.hg/
+.hgignore
+.svn/
+.bzr/
+.bzrignore
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*.bak
+*.tmp
+*.orig
+*~
+.DS_Store
+
+# --- CI / tooling / repo scaffolding (not part of the chart) ---
+.github/
+.circleci/
+.gitlab-ci.yml
+Makefile
+*.tgz
+.helmignore
+
+# --- Project docs & specs that must not ship inside the chart package ---
+specs/
+internal/
+.claude/
+docs/
+CONTRIBUTING.md
+LICENSE
+
+# --- Local dev / test scaffolding ---
+ci/
+tests/
+*_test.yaml
+.values/
+values.local.yaml
+env*.values.yaml

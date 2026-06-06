@@ -1,0 +1,33 @@
+{{/*
+Service (Spec 5.3) -- always rendered.
+ClusterIP (or configured type) fronting the workspace pod. Exposes exactly one
+port named "public" that forwards to the oauth-proxy sidecar's "public" container
+port when oauth-proxy is enabled, otherwise straight to "code-server". The Route's
+spec.port.targetPort references THIS Service port by name ("public").
+
+The selector MUST be the STABLE per-developer selectorLabels so it only matches
+this developer's pod in the shared namespace -- never the broad metadata labels.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dev-workspaces.fullname" . }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- $svcAnnotations := merge (deepCopy (.Values.service.annotations | default dict)) (fromYaml (include "dev-workspaces.annotations" .) | default dict) }}
+  {{- with $svcAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "dev-workspaces.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: public
+      port: {{ .Values.service.port }}
+      protocol: TCP
+      targetPort: {{ if .Values.oauthProxy.enabled }}public{{ else }}code-server{{ end }}

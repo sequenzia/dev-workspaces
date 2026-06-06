@@ -1,0 +1,21 @@
+# Workspace with the optional idle reaper CronJob enabled. The reaper reads pod
+# CPU from the metrics API; after idleMinutes of continuous sub-threshold CPU it
+# scales the Deployment to 0. It no-ops safely if metrics are unavailable, so it
+# never suspends an active or unmeasurable workspace. Resume stays explicit.
+user: erin
+
+route:
+  host: erin-workspace.apps.example.com
+  tls:
+    externalCertificate:
+      name: erin-workspace-tls
+
+oauthProxy:
+  cookieSecret:
+    existingSecret: erin-oauth-cookie
+
+idleReaper:
+  enabled: true
+  schedule: "*/10 * * * *"
+  idleMinutes: 45
+  cpuThresholdMillicores: 50

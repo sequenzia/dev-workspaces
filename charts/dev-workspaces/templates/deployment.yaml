@@ -1,0 +1,232 @@
+{{- include "dev-workspaces.validateSecrets" . }}
+{{/*
+Deployment (Spec 5.1 / 5.4 / 5.7 / 5.9) -- always rendered. The linchpin object.
+
+One workspace container (code-server + Jupyter) plus an optional oauth-proxy
+sidecar that fronts both upstreams. Single-tenant by design:
+  - replicas is 0 (suspended) or 1 -- NEVER >1 (RWO PVC + single user).
+  - strategy.type: Recreate is MANDATORY; RollingUpdate would deadlock on the
+    RWO volume (Multi-Attach) during suspend/resume and upgrades.
+  - selector.matchLabels uses the STABLE per-developer selectorLabels, which are
+    immutable for the life of the release.
+The checksum/config annotation rolls the pod when the ConfigMap content changes.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dev-workspaces.fullname" . }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- $annotations := merge (deepCopy (.Values.commonAnnotations | default dict)) (fromYaml (include "dev-workspaces.annotations" .) | default dict) }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /*
+    Replicas ownership:
+      - suspended=true            => 0 (explicit hard-suspend; chart-managed, wins everywhere).
+      - idleReaper disabled       => 1 (chart fully manages the suspend/resume toggle, US-007).
+      - idleReaper enabled+running => OMIT replicas, so the reaper's live `oc scale --replicas=0`
+        is authoritative and a later `helm upgrade` (or GitOps reconcile) does NOT silently
+        resume it. Resume from a reaped state is then an explicit `oc scale --replicas=1`.
+  */}}
+  {{- if .Values.suspended }}
+  replicas: 0
+  {{- else if not .Values.idleReaper.enabled }}
+  replicas: 1
+  {{- end }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "dev-workspaces.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dev-workspaces.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- $podAnnotations := merge (dict) (.Values.podAnnotations | default dict) (.Values.commonAnnotations | default dict) }}
+      {{- if .Values.configMap.enabled }}
+      {{- $_ := set $podAnnotations "checksum/config" (include (print $.Template.BasePath "/configmap.yaml") . | sha256sum) }}
+      {{- end }}
+      {{- with $podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "dev-workspaces.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.securityContext.runAsGroup }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: workspace
+          image: {{ include "dev-workspaces.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: code-server
+              containerPort: {{ .Values.workspace.codeServer.port }}
+              protocol: TCP
+            - name: jupyter
+              containerPort: {{ .Values.workspace.jupyter.port }}
+              protocol: TCP
+            {{- if .Values.ssh.enabled }}
+            - name: ssh
+              containerPort: {{ .Values.ssh.containerPort }}
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: CODE_SERVER_PORT
+              value: {{ .Values.workspace.codeServer.port | quote }}
+            - name: JUPYTER_PORT
+              value: {{ .Values.workspace.jupyter.port | quote }}
+            - name: JUPYTER_BASE_PATH
+              value: {{ .Values.workspace.jupyter.basePath | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.workspace.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or .Values.persistence.enabled .Values.configMap.enabled .Values.ssh.enabled .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- if .Values.persistence.enabled }}
+            - name: workspace-data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- end }}
+            {{- if .Values.configMap.enabled }}
+            - name: workspace-config
+              mountPath: {{ .Values.configMap.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.ssh.enabled }}
+            - name: ssh-authorized-keys
+              mountPath: /etc/ssh/authorized-keys
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.workspace.livenessProbe.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: code-server
+            initialDelaySeconds: {{ .Values.workspace.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.workspace.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.workspace.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.workspace.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.workspace.readinessProbe.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: code-server
+            initialDelaySeconds: {{ .Values.workspace.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.workspace.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.workspace.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.workspace.readinessProbe.failureThreshold }}
+          {{- end }}
+        {{- if .Values.oauthProxy.enabled }}
+        - name: oauth-proxy
+          image: {{ printf "%s:%s" .Values.oauthProxy.image.repository .Values.oauthProxy.image.tag | quote }}
+          imagePullPolicy: {{ .Values.oauthProxy.image.pullPolicy }}
+          ports:
+            - name: public
+              containerPort: {{ .Values.oauthProxy.port }}
+              protocol: TCP
+          args:
+            - --provider=openshift
+            - --https-address=
+            - --http-address=:{{ .Values.oauthProxy.port }}
+            - --openshift-service-account={{ include "dev-workspaces.serviceAccountName" . }}
+            - --upstream=http://localhost:{{ .Values.workspace.codeServer.port }}/
+            - --upstream=http://localhost:{{ .Values.workspace.jupyter.port }}{{ .Values.workspace.jupyter.basePath }}
+            - --cookie-secret-file=/etc/oauth/secrets/{{ .Values.oauthProxy.cookieSecret.key }}
+            - --cookie-secure=true
+            - --skip-provider-button=true
+            - --proxy-websockets=true
+            - --openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            {{- range .Values.oauthProxy.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: oauth-cookie
+              mountPath: /etc/oauth/secrets
+              readOnly: true
+          {{- with .Values.oauthProxy.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      {{- if or .Values.persistence.enabled .Values.configMap.enabled .Values.oauthProxy.enabled .Values.ssh.enabled .Values.extraVolumes }}
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: workspace-data
+          persistentVolumeClaim:
+            claimName: {{ include "dev-workspaces.fullname" . }}
+        {{- end }}
+        {{- if .Values.configMap.enabled }}
+        - name: workspace-config
+          configMap:
+            name: {{ include "dev-workspaces.fullname" . }}
+        {{- end }}
+        {{- if .Values.oauthProxy.enabled }}
+        - name: oauth-cookie
+          secret:
+            secretName: {{ .Values.oauthProxy.cookieSecret.existingSecret | quote }}
+        {{- end }}
+        {{- if .Values.ssh.enabled }}
+        - name: ssh-authorized-keys
+          secret:
+            secretName: {{ .Values.ssh.existingSecret | quote }}
+            # Project the configured key to a fixed filename so ssh.key is
+            # honored and the path is deterministic regardless of the Secret key.
+            items:
+              - key: {{ .Values.ssh.key }}
+                path: authorized_keys
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}

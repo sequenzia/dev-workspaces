@@ -1,0 +1,17 @@
+# Suspended workspace: Deployment scales to 0 replicas (zero compute cost),
+# the retained PVC is untouched. Resume with suspended=false.
+#
+#   helm upgrade alice charts/dev-workspaces -n dev-workspaces \
+#       -f examples/values-suspended.yaml --reuse-values --set suspended=false
+user: alice
+suspended: true
+
+route:
+  host: alice-workspace.apps.example.com
+  tls:
+    externalCertificate:
+      name: alice-workspace-tls
+
+oauthProxy:
+  cookieSecret:
+    existingSecret: alice-oauth-cookie

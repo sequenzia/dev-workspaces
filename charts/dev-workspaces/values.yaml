@@ -1,0 +1,381 @@
+# ============================================================================
+# dev-workspaces -- per-developer OpenShift workspace
+# ============================================================================
+# One Helm RELEASE == one developer. Resources are name-prefixed
+# `dev-workspace-<user>` and live in a SHARED namespace.
+#
+# GitOps model: commit a small per-developer values file (e.g.
+# `developers/alice.values.yaml`) that sets ONLY what differs from these
+# defaults -- typically: user, route.host, and the existingSecret NAMES.
+# Everything else here is a sensible, documented default.
+#
+# Minimal per-developer file:
+#   user: alice
+#   route:
+#     host: alice-workspace.apps.example.com
+#     tls:
+#       externalCertificate:
+#         name: alice-workspace-tls       # pre-created kubernetes.io/tls Secret
+#   oauthProxy:
+#     cookieSecret:
+#       existingSecret: alice-oauth-cookie # pre-created Opaque Secret
+#
+# Sensitive material is NEVER stored here. The TLS cert/key, the oauth-proxy
+# cookie secret, and SSH keys are referenced by the NAME of a pre-created
+# Secret only -- raw secret values are never templated from this file.
+# ============================================================================
+
+# --- REQUIRED ---------------------------------------------------------------
+# The developer this release belongs to. Drives every resource name
+# (dev-workspace-<user>) and the per-developer selector label.
+# Must be a DNS-1123 label fragment (lowercase alphanumeric and '-'), <=40 chars
+# so the `dev-workspace-` prefix (14 chars) leaves room for suffixed RBAC/SCC
+# names within the 63-char limit. IMMUTABLE for the life of a release: it (with
+# the release name) forms the immutable Deployment/Service selector. Enforced by
+# values.schema.json AND the dev-workspaces.user helper; `helm install` fails
+# fast if unset/invalid (non-conforming users are REJECTED, never auto-rewritten).
+user: ""
+
+# --- Lifecycle --------------------------------------------------------------
+# Suspend/resume. `false` => Deployment replicas=1 (running).
+# `true`  => Deployment replicas=0 (suspended; PVC retained, zero compute).
+# This is the single knob Ops (or the idle CronJob) flips per workspace.
+suspended: false
+
+# --- Workspace image --------------------------------------------------------
+# NOTE: placeholder image until the real one ships (ImagePullBackOff expected).
+image:
+  repository: registry.example.com/dev-workspaces/workspace
+  tag: ""                       # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: names of pre-created docker-registry Secrets (optional).
+imagePullSecrets: []
+# - name: my-registry-pull-secret
+
+# --- Names ------------------------------------------------------------------
+# Override the generated chart-name segment of labels (rarely needed).
+nameOverride: ""
+# Hard-override the full resource name prefix. Leave empty to use the computed
+# `dev-workspace-<user>` (strongly recommended for GitOps).
+fullnameOverride: ""
+
+# Extra labels/annotations applied to ALL rendered resources.
+commonLabels: {}
+commonAnnotations: {}
+
+# ============================================================================
+# Workspace application (ports + per-container resources)
+# ============================================================================
+# Container ports for code-server and Jupyter are declared on the pod; the
+# oauth-proxy sidecar fronts them and is the only port the Service exposes.
+workspace:
+  codeServer:
+    port: 8080                  # code-server listens here; oauth-proxy '/' upstream
+  jupyter:
+    port: 8888                  # Jupyter Lab listens here; proxied under basePath
+    basePath: /jupyter/         # must match Jupyter --ServerApp.base_url (image contract)
+  # Resource envelope for the workspace container (modest documented defaults).
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  # Liveness/readiness probes for the workspace container (oauth-proxy fronts it).
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+# ============================================================================
+# Persistent storage (durable $HOME)
+# ============================================================================
+persistence:
+  enabled: true
+  size: 10Gi
+  # Set explicitly if the cluster has no default StorageClass.
+  # "" => use cluster default. "-" => disable dynamic provisioning.
+  # If "" AND no cluster default exists, the PVC stays Pending -- set a class.
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce             # single-user RWO; do not change (Multi-Attach).
+  # Mount point for the PVC inside the workspace container ($HOME).
+  mountPath: /home/dev
+  # The PVC is annotated `helm.sh/resource-policy: keep` automatically when
+  # `retain: true` so it SURVIVES `helm uninstall`. Set false ONLY to allow
+  # deletion together with the release.
+  retain: true
+  # Bind to a specific pre-provisioned PV (optional).
+  volumeName: ""
+  annotations: {}
+  labels: {}
+
+# ============================================================================
+# Service (ClusterIP -> oauth-proxy public port)
+# ============================================================================
+service:
+  type: ClusterIP
+  # Public port the Service exposes; forwards to the oauth-proxy sidecar's named
+  # container port "public" (oauthProxy.port). The Route's port.targetPort
+  # references this Service port by name. Distinct from every in-pod listener
+  # (code-server 8080, Jupyter 8888, oauth-proxy 4180) to avoid collisions.
+  port: 8443
+  annotations: {}
+  labels: {}
+
+# ============================================================================
+# OpenShift Route (edge TLS, custom cert referenced from a Secret)
+# ============================================================================
+route:
+  enabled: true
+  # REQUIRED in practice: the external hostname. Must be covered by the custom
+  # cert SAN (route.tls.externalCertificate.name). Enforced in templates when
+  # route.enabled=true.
+  host: ""
+  # Path the Route serves (usually "" => "/").
+  path: ""
+  # Edge termination is mandated by the spec. The cert/key are referenced from
+  # a Secret via externalCertificate -- NEVER inline `certificate`/`key`.
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect   # Redirect | Allow | None
+    # OpenShift externally-managed cert: references a kubernetes.io/tls Secret
+    # (keys tls.crt + tls.key) in THIS namespace.
+    #   NOTE: spec.tls.externalCertificate is GA on OCP 4.19+; on 4.16-4.18 the
+    #   RouteExternalCertificate feature gate must be enabled by Ops.
+    externalCertificate:
+      name: ""                  # REQUIRED Secret NAME when route.enabled=true
+    # The router's service account (openshift-ingress:router) must be able to
+    # read the named cert Secret, or the router silently serves its default
+    # wildcard cert. When true, the chart renders a secret-reader Role +
+    # RoleBinding scoped to exactly that Secret. Set false to let Ops grant it
+    # cluster-side once (e.g. when many releases share one wildcard cert).
+    createRouterRbac: true
+    # The exact subject the secret-reader RoleBinding grants. Defaults to the
+    # OpenShift default IngressController's router SA. Override only for a
+    # custom-named IngressController (its SA is router-<name> in this namespace).
+    routerServiceAccount:
+      namespace: openshift-ingress
+      name: router
+  # Router timeout (long-lived WebSockets / code-server need a high value).
+  timeout: 600s
+  wildcardPolicy: None
+  annotations: {}
+  labels: {}
+
+# ============================================================================
+# OpenShift OAuth SSO (oauth-proxy sidecar)
+# ============================================================================
+# Behind an EDGE route the proxy listens on plain HTTP (TLS terminates at the
+# router) and its HTTPS listener is disabled. Secure cookies and https:// OAuth
+# redirects are made valid by --cookie-secure=true (set in the Deployment), not
+# by any X-Forwarded-Proto handling.
+#
+# CA note: the proxy reaches the in-cluster API server using the mounted SA
+# ca.crt. If OAuth token redemption fails with a TLS error (the public OAuth
+# route presents the cluster's ingress cert, which the SA ca.crt may not chain
+# to), mount the ingress/cluster CA and add another --openshift-ca for it via
+# extraArgs + extraVolumes/extraVolumeMounts, or use a publicly-trusted ingress cert.
+oauthProxy:
+  enabled: true
+  image:
+    # Production: pin Red Hat's ose-oauth-proxy to the cluster version (e.g. v4.19).
+    # The public openshift/oauth-proxy:latest is OKD/upstream only.
+    repository: registry.redhat.io/openshift4/ose-oauth-proxy
+    tag: "v4.19"
+    pullPolicy: IfNotPresent
+  # Port the oauth-proxy listens on (plain HTTP, named container port "public").
+  # Distinct from the code-server (8080) and Jupyter (8888) upstreams it fronts.
+  port: 4180
+  # Restrict who may authenticate. Empty => any authenticated cluster user.
+  # Add e.g. "--openshift-sar=..." or "--openshift-delegate-urls=..." here.
+  extraArgs: []
+  # - "--pass-access-token"
+  # Cookie/session secret -- referenced from a pre-created Opaque Secret.
+  # The secret value MUST be 16, 24, or 32 bytes (AES), e.g.:
+  #   oc create secret generic <name> \
+  #     --from-literal=cookie-secret=$(openssl rand -base64 32)
+  cookieSecret:
+    existingSecret: ""          # REQUIRED Secret NAME when oauthProxy.enabled=true
+    key: cookie-secret          # key within that Secret
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# ============================================================================
+# Workspace configuration (ConfigMap, mounted into the pod)
+# ============================================================================
+# Each entry becomes a file in the ConfigMap. Override content per developer
+# or globally. enabled=false => no ConfigMap; image defaults apply.
+configMap:
+  enabled: true
+  # Directory the rendered config files are mounted under.
+  mountPath: /etc/dev-workspace
+  # File name -> file content. Defaults give a consistent baseline.
+  files:
+    bashrc: |
+      # dev-workspaces managed ~/.bashrc baseline
+      export EDITOR=vim
+      export PAGER=less
+      alias ll='ls -alF'
+      alias gs='git status'
+    vimrc: |
+      " dev-workspaces managed ~/.vimrc baseline
+      set number
+      set expandtab
+      set tabstop=2
+      set shiftwidth=2
+      syntax on
+    code-server-settings.json: |
+      {
+        "workbench.colorTheme": "Default Dark Modern",
+        "editor.formatOnSave": true,
+        "files.autoSave": "afterDelay"
+      }
+  annotations: {}
+  labels: {}
+
+# ============================================================================
+# Security context (fixed UID)
+# ============================================================================
+# OpenShift "arbitrary UID" pattern: fixed runAsUser, group 0, group-writable
+# $HOME. runAsUser is the fixed UID the SCC (below) must admit.
+securityContext:
+  runAsUser: 1001
+  runAsGroup: 0
+  fsGroup: 1001                 # owns the RWO PVC so the fixed UID can write $HOME
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false # code-server writes extensions/settings under $HOME
+
+# ============================================================================
+# SecurityContextConstraints (optional, gated -- needs cluster-admin)
+# ============================================================================
+scc:
+  # Render an SCC (+ use Role/RoleBinding) admitting the fixed UID.
+  # Default OFF: applying an SCC requires cluster-admin.
+  create: false
+  # Which policy to apply when create=true:
+  #   custom => least-privilege SCC pinned to securityContext.runAsUser
+  #   anyuid => bind the built-in `anyuid` SCC (RunAsAny) to the SA instead
+  use: custom
+  # Name of the custom SCC (when use=custom). Empty => <fullname>-scc.
+  name: ""
+  # Selection priority of the custom SCC (use=custom). Higher wins over other
+  # SCCs the ServiceAccount may also be granted (a nil priority sorts as 0).
+  priority: 10
+  annotations: {}
+
+# ============================================================================
+# ServiceAccount (annotated as an OpenShift OAuth client)
+# ============================================================================
+serviceAccount:
+  create: true
+  # Empty => use the computed `dev-workspace-<user>` name.
+  name: ""
+  # The OAuth redirect reference (-> the Route) is added automatically when
+  # route.enabled and oauthProxy.enabled. Add extra annotations here.
+  annotations: {}
+  # Must stay true: oauth-proxy reads OAuth client creds from the SA token.
+  automountServiceAccountToken: true
+  # Pull secrets attached to the SA (optional).
+  imagePullSecrets: []
+
+# ============================================================================
+# Idle reaper (optional, gated CronJob -- scales the Deployment to 0)
+# ============================================================================
+# NOTE: when enabled, the chart STOPS managing the Deployment replica count
+# while the workspace is running (it omits `replicas`) so the reaper's live
+# scale-to-0 is not reverted by `helm upgrade` or a GitOps reconcile. Resume a
+# reaped workspace explicitly with:
+#   oc scale deployment/dev-workspace-<user> --replicas=1
+# The `suspended: true` toggle still forces an explicit scale-to-0 in either mode.
+idleReaper:
+  enabled: false
+  schedule: "*/15 * * * *"
+  # Suspend after this many minutes of CONTINUOUS idle (tracked via a Deployment
+  # annotation across reaper runs). Resume stays explicit (suspended=false).
+  idleMinutes: 60
+  # Activity heuristic: a workspace pod using fewer than this many CPU millicores
+  # is considered idle (an active code-server/Jupyter session uses CPU; an idle
+  # one is near-zero). The reaper reads pod CPU from the metrics API and NO-OPS
+  # safely when metrics are unavailable, so it never suspends an active or
+  # unmeasurable workspace. Signal source is configurable (spec Open Question #3).
+  cpuThresholdMillicores: 50
+  # Image with `oc`/`kubectl` to perform `scale --replicas=0`.
+  image:
+    repository: registry.redhat.io/openshift4/ose-cli
+    tag: "v4.19"
+    pullPolicy: IfNotPresent
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  restartPolicy: Never
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  annotations: {}
+
+# ============================================================================
+# SSH access (optional, gated -- image must ship an SSH server)
+# ============================================================================
+ssh:
+  enabled: false
+  # Container port the SSH server listens on inside the pod.
+  containerPort: 2222
+  # Public SSH authorized_keys come from a pre-created Opaque Secret.
+  existingSecret: ""            # REQUIRED Secret NAME when ssh.enabled=true
+  key: authorized_keys          # key within that Secret
+  service:
+    type: ClusterIP             # ClusterIP | NodePort | LoadBalancer
+    port: 22
+    nodePort: null              # set when type=NodePort
+    annotations: {}
+
+# ============================================================================
+# Pod scheduling & extras
+# ============================================================================
+extraEnv: []
+# - name: TZ
+#   value: UTC
+# - name: SOME_TOKEN
+#   valueFrom:
+#     secretKeyRef:
+#       name: my-existing-secret
+#       key: token
+
+# Mount additional pre-created Secrets/ConfigMaps without templating values.
+extraVolumes: []
+extraVolumeMounts: []
+
+# Extra pod-level annotations/labels (e.g. for ArgoCD sync waves).
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Grace period for the workspace container to flush before SIGKILL.
+terminationGracePeriodSeconds: 30
+
+# Priority class for the pod (optional).
+priorityClassName: ""

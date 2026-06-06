@@ -1,0 +1,201 @@
+{{- if .Values.idleReaper.enabled }}
+{{- $reaperName := printf "%s-reaper" (include "dev-workspaces.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- $annotations := merge (dict) (.Values.idleReaper.annotations | default dict) (.Values.commonAnnotations | default dict) }}
+{{- /*
+  Idle reaper (spec 5.8, default OFF). Suspends a continuously-idle workspace
+  by scaling its Deployment to 0 replicas. Continuous-idle is tracked across
+  runs via the Deployment annotation dev-workspaces.io/idle-since. The CPU
+  heuristic below is a documented MVP placeholder (spec Open Question #3 --
+  signal source is TBD: last route access vs CPU vs code-server heartbeat) and
+  NO-OPS safely when the metrics API is unavailable so it never suspends an
+  active or unmeasurable workspace. Resume stays an EXPLICIT action; the reaper
+  never wakes a workspace. Runs under its OWN least-privilege ServiceAccount so
+  the user-facing workspace pod identity never carries scale/patch power.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $reaperName }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- with .Values.serviceAccount.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $reaperName }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $reaperName }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $reaperName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $reaperName }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $reaperName }}
+  labels:
+    {{- include "dev-workspaces.labels" . | nindent 4 }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  schedule: {{ .Values.idleReaper.schedule | quote }}
+  concurrencyPolicy: {{ .Values.idleReaper.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.idleReaper.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.idleReaper.failedJobsHistoryLimit }}
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "dev-workspaces.labels" . | nindent 8 }}
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "dev-workspaces.labels" . | nindent 12 }}
+        spec:
+          restartPolicy: {{ .Values.idleReaper.restartPolicy }}
+          serviceAccountName: {{ $reaperName }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.priorityClassName }}
+          priorityClassName: {{ . | quote }}
+          {{- end }}
+          containers:
+            - name: reaper
+              image: "{{ .Values.idleReaper.image.repository }}:{{ .Values.idleReaper.image.tag }}"
+              imagePullPolicy: {{ .Values.idleReaper.image.pullPolicy }}
+              {{- with .Values.idleReaper.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              env:
+                - name: DEPLOYMENT
+                  value: {{ include "dev-workspaces.fullname" . | quote }}
+                - name: NAMESPACE
+                  value: {{ .Release.Namespace | quote }}
+                - name: USER_LABEL
+                  value: {{ printf "dev-workspaces.io/user=%s" (include "dev-workspaces.user" .) | quote }}
+                - name: IDLE_MINUTES
+                  value: {{ .Values.idleReaper.idleMinutes | quote }}
+                - name: CPU_THRESHOLD_MILLICORES
+                  value: {{ .Values.idleReaper.cpuThresholdMillicores | quote }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  IDLE_ANNOTATION="dev-workspaces.io/idle-since"
+                  NOW="$(date -u +%s)"
+                  IDLE_LIMIT_SECONDS="$(( IDLE_MINUTES * 60 ))"
+
+                  # --- Read this developer's pod CPU usage (millicores) ----------
+                  # MVP heuristic (spec Open Question #3). NO-OP safely if the
+                  # metrics API is unavailable so an active or unmeasurable
+                  # workspace is never suspended.
+                  TOP="$(oc adm top pod -n "$NAMESPACE" -l "$USER_LABEL" --no-headers 2>/dev/null)" \
+                    || { echo "metrics unavailable; skipping idle check"; exit 0; }
+
+                  if [ -z "$TOP" ]; then
+                    echo "no pods matched $USER_LABEL (already suspended?); nothing to do"
+                    exit 0
+                  fi
+
+                  # Sum the CPU column across matched pods. `oc adm top` prints CPU
+                  # as e.g. "5m"; strip the trailing 'm' to compare millicores.
+                  CPU_MILLICORES="$(echo "$TOP" | awk '{ gsub(/m$/, "", $2); sum += $2 } END { print sum + 0 }')"
+                  echo "workspace CPU usage: ${CPU_MILLICORES}m (idle threshold: ${CPU_THRESHOLD_MILLICORES}m)"
+
+                  clear_idle_marker() {
+                    oc annotate deployment/"$DEPLOYMENT" -n "$NAMESPACE" "${IDLE_ANNOTATION}-" --overwrite >/dev/null 2>&1 || true
+                  }
+
+                  if [ "$CPU_MILLICORES" -ge "$CPU_THRESHOLD_MILLICORES" ]; then
+                    echo "workspace is active; clearing any idle marker"
+                    clear_idle_marker
+                    exit 0
+                  fi
+
+                  # --- Workspace is idle: track CONTINUOUS idle via annotation ----
+                  IDLE_SINCE="$(oc get deployment/"$DEPLOYMENT" -n "$NAMESPACE" \
+                    -o "jsonpath={.metadata.annotations.dev-workspaces\.io/idle-since}" 2>/dev/null || true)"
+
+                  if [ -z "$IDLE_SINCE" ]; then
+                    echo "workspace newly idle; recording idle-since=$NOW"
+                    oc annotate deployment/"$DEPLOYMENT" -n "$NAMESPACE" "${IDLE_ANNOTATION}=${NOW}" --overwrite
+                    exit 0
+                  fi
+
+                  # Self-heal a corrupt/non-numeric marker so a bad annotation
+                  # can never permanently wedge the reaper under `set -eu`.
+                  case "$IDLE_SINCE" in
+                    ''|*[!0-9]*)
+                      echo "idle-since marker '$IDLE_SINCE' is non-numeric; resetting to $NOW"
+                      oc annotate deployment/"$DEPLOYMENT" -n "$NAMESPACE" "${IDLE_ANNOTATION}=${NOW}" --overwrite
+                      exit 0
+                      ;;
+                  esac
+
+                  IDLE_FOR="$(( NOW - IDLE_SINCE ))"
+                  echo "workspace idle for ${IDLE_FOR}s (limit ${IDLE_LIMIT_SECONDS}s)"
+
+                  if [ "$IDLE_FOR" -ge "$IDLE_LIMIT_SECONDS" ]; then
+                    echo "idle threshold reached; suspending workspace (scale to 0)"
+                    oc scale deployment/"$DEPLOYMENT" -n "$NAMESPACE" --replicas=0
+                    clear_idle_marker
+                  else
+                    echo "idle but below threshold; leaving running"
+                  fi
+{{- end }}

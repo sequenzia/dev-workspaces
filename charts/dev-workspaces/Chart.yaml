@@ -1,0 +1,43 @@
+apiVersion: v2
+name: dev-workspaces
+description: >-
+  OpenShift-native per-developer workspace (code-server + Jupyter Lab) with
+  OpenShift OAuth SSO, persistent storage, and a suspend/resume lifecycle.
+  One Helm release per developer; resources are name-prefixed
+  dev-workspace-<user> in a shared namespace.
+type: application
+
+# Chart version: bumped on every chart change (SemVer). Independent of appVersion.
+version: 0.1.0
+
+# appVersion tracks the placeholder workspace image; quoted per Helm guidance.
+# Keep in sync with image.tag default in values.yaml (empty => uses this value).
+appVersion: "0.1.0"
+
+# This chart is intentionally OpenShift-native (Route, OAuth, SCC).
+# Floor is k8s 1.29 == OCP 4.16, the earliest release where the only Route path
+# this chart emits -- spec.tls.externalCertificate -- EXISTS (behind the
+# RouteExternalCertificate feature gate on 4.16-4.18; GA on 4.19+ / k8s 1.32).
+# Below 4.16 the field is rejected, so the chart genuinely cannot work there.
+kubeVersion: ">=1.29.0-0"
+
+keywords:
+  - openshift
+  - developer-workspace
+  - code-server
+  - jupyter
+  - oauth-proxy
+  - remote-development
+
+home: https://github.com/sequenzia/dev-workspaces
+sources:
+  - https://github.com/sequenzia/dev-workspaces
+
+maintainers:
+  - name: Stephen Sequenzia
+    email: sequenzia@gmail.com
+
+annotations:
+  # Informational only; OpenShift / ArgoCD tooling may surface these.
+  category: Development
+  licenses: Apache-2.0

@@ -1,0 +1,19 @@
+# Workspace that binds the pre-existing built-in anyuid SCC to the workspace
+# ServiceAccount instead of creating a custom SCC. No SCC object is rendered;
+# only a RoleBinding to ClusterRole system:openshift:scc:anyuid. Still requires
+# cluster-admin to apply the binding.
+user: dave
+
+route:
+  host: dave-workspace.apps.example.com
+  tls:
+    externalCertificate:
+      name: dave-workspace-tls
+
+oauthProxy:
+  cookieSecret:
+    existingSecret: dave-oauth-cookie
+
+scc:
+  create: true
+  use: anyuid

@@ -1,0 +1,20 @@
+# Workspace that also renders a least-privilege custom SCC pinned to the fixed
+# UID, plus the use Role/RoleBinding. Applying an SCC requires cluster-admin.
+#
+#   helm install carol charts/dev-workspaces -n dev-workspaces \
+#       -f examples/values-scc-custom.yaml   # run as cluster-admin
+user: carol
+
+route:
+  host: carol-workspace.apps.example.com
+  tls:
+    externalCertificate:
+      name: carol-workspace-tls
+
+oauthProxy:
+  cookieSecret:
+    existingSecret: carol-oauth-cookie
+
+scc:
+  create: true
+  use: custom

@@ -1,0 +1,24 @@
+# Workspace with optional SSH access enabled (depends on the future image
+# shipping an sshd). Exposes an SSH Service; here as a NodePort.
+#
+# Pre-create the authorized_keys Secret:
+#   oc create secret generic bob-ssh-authorized-keys \
+#       --from-file=authorized_keys=$HOME/.ssh/id_ed25519.pub
+user: bob
+
+route:
+  host: bob-workspace.apps.example.com
+  tls:
+    externalCertificate:
+      name: bob-workspace-tls
+
+oauthProxy:
+  cookieSecret:
+    existingSecret: bob-oauth-cookie
+
+ssh:
+  enabled: true
+  existingSecret: bob-ssh-authorized-keys
+  service:
+    type: NodePort
+    nodePort: 30222
